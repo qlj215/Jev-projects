@@ -5,11 +5,13 @@ import json
 import os
 from pathlib import Path
 import secrets
+import sqlite3
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.error
 
+import history
 from jev import AnswerError, QuestionError, ask, build_question, evaluate
 
 KEY_FILE = Path.home() / '.config' / 'jev-local' / 'api-key'
@@ -103,8 +105,26 @@ class Handler(BaseHTTPRequestHandler):
                 with KEY_LOCK:
                     KEY_FILE.unlink(missing_ok=True)
                 return self.reply(200, {'ok': True})
+            if self.path == '/api/history/list':
+                offset = data.get('offset', 0)
+                if type(offset) is not int or not 0 <= offset <= 2**31 - 1:
+                    return self.reply(400, {'error': '历史页码无效。'})
+                return self.reply(200, history.list_records(offset))
+            if self.path == '/api/history/clear':
+                return self.reply(200, {'deleted': history.clear()})
+            if self.path in ('/api/history/get', '/api/history/delete'):
+                record_id = data.get('id')
+                if not isinstance(record_id, str) or not 1 <= len(record_id) <= 128:
+                    return self.reply(400, {'error': '历史记录编号无效。'})
+                if self.path == '/api/history/delete':
+                    return self.reply(200, {'deleted': history.delete(record_id)})
+                record = history.get(record_id)
+                return self.reply(404, {'error': '这条记录已被删除。'}) if record is None else self.reply(200, record)
             if self.path != '/api/ask':
                 return self.reply(404, {'error': '接口不存在。'})
+            save_history = data.get('save_history', False)
+            if type(save_history) is not bool:
+                return self.reply(400, {'error': '历史保存开关无效。'})
             text, question = data.get('text'), data.get('question')
             if not isinstance(text, str) or not isinstance(question, str) or not text.strip() or not question.strip():
                 return self.reply(400, {'error': '请填写文本和判断问题。'})
@@ -116,10 +136,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(400, {'error': '请先保存 API Key。'})
             if kind == 'noul':
                 probability = ask(text, question, key)
-                self.reply(200, {'yes': probability, 'no': 1 - probability})
+                answer = {'yes': probability, 'no': 1 - probability}
             else:
                 answer = evaluate(text, question, key, kind, typed_question['criteria'])
-                self.reply(200, answer)
+            if save_history:
+                try:
+                    history.save(text, question, kind, typed_question.get('criteria'), answer)
+                except (OSError, sqlite3.Error):
+                    # 判断已成功，保存失败不应伪装成 API 失败或触发再次计费。
+                    answer = {**answer, 'history_saved': False}
+                else:
+                    answer = {**answer, 'history_saved': True}
+            self.reply(200, answer)
         except QuestionError as error:
             self.reply(400, {'error': str(error)})
         except AnswerError:
@@ -131,6 +159,8 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(502, {'error': '网络连接失败或超时，请重试。'})
         except (ValueError, TypeError, KeyError):
             self.reply(400, {'error': '请求或服务响应格式无效。'})
+        except sqlite3.Error:
+            self.reply(500, {'error': '历史记录无法读取或写入，请检查本机存储。'})
         except OSError:
             self.reply(500, {'error': '本机文件或连接操作失败，请检查权限及网络。'})
 

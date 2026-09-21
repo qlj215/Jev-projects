@@ -5,12 +5,14 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import sqlite3
 import unittest
 import urllib.error
 import urllib.request
 from unittest.mock import patch
 
 import web
+import history
 from jev import AnswerError
 
 
@@ -21,6 +23,9 @@ class WebTests(unittest.TestCase):
         keyfile = patch.object(web, 'KEY_FILE', Path(self.temp.name) / 'keys' / 'api-key')
         keyfile.start()
         self.addCleanup(keyfile.stop)
+        historyfile = patch.object(history, 'HISTORY_FILE', Path(self.temp.name) / 'history' / 'history.sqlite3')
+        historyfile.start()
+        self.addCleanup(historyfile.stop)
         env = patch.dict(os.environ, {'TYPESAFE_API_KEY': ''})
         env.start()
         self.addCleanup(env.stop)
@@ -140,6 +145,79 @@ class WebTests(unittest.TestCase):
             status, body = self.request('/api/ask', {'text': '文本', 'question': '问题', 'type': 'score', 'criteria': ['低', '高']})
             self.assertEqual(status, 502)
             self.assertNotIn('secret-like-content', body)
+
+    def test_private_mode_never_reads_or_writes_history(self):
+        web.save_key('fake-key')
+        with patch.object(web, 'ask', return_value=0.75) as ask, patch.object(history, 'save') as save, patch.object(history, 'get') as get, patch.object(history, 'list_records') as listing:
+            for extra in ({}, {'save_history': False}):
+                status, body = self.request('/api/ask', {'text': '无痕文本', 'question': '是否？', **extra})
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body), {'yes': 0.75, 'no': 0.25})
+                ask.assert_called_with('无痕文本', '是否？', 'fake-key')
+            save.assert_not_called()
+            get.assert_not_called()
+            listing.assert_not_called()
+        self.assertFalse(history.HISTORY_FILE.exists())
+
+    def test_saved_history_is_durable_and_not_model_context(self):
+        web.save_key('fake-key')
+        with patch.object(web, 'ask', return_value=0.75) as ask:
+            status, body = self.request('/api/ask', {'text': '第一条', 'question': '是否？', 'save_history': True})
+            self.assertEqual(status, 200)
+            self.assertTrue(json.loads(body)['history_saved'])
+            self.request('/api/ask', {'text': '第二条', 'question': '独立问题？', 'save_history': True})
+            ask.assert_called_with('第二条', '独立问题？', 'fake-key')
+        self.stop_server()
+        self.server = web.make_server(0)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base = f'http://127.0.0.1:{self.server.server_port}'
+        status, body = self.request('/api/history/list', {})
+        listing = json.loads(body)
+        self.assertEqual(listing['total'], 2)
+        self.assertNotIn('fake-key', body)
+        self.assertNotIn(b'fake-key', history.HISTORY_FILE.read_bytes())
+        record_id = listing['items'][0]['id']
+        with patch.object(web, 'ask') as ask:
+            status, body = self.request('/api/history/get', {'id': record_id})
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)['text'], '第二条')
+            self.assertEqual(json.loads(body)['answer'], {'yes': 0.75, 'no': 0.25})
+            ask.assert_not_called()
+        self.assertEqual(json.loads(self.request('/api/history/delete', {'id': record_id})[1])['deleted'], 1)
+        self.assertEqual(self.request('/api/history/get', {'id': record_id})[0], 404)
+        self.assertEqual(json.loads(self.request('/api/history/clear', {})[1])['deleted'], 1)
+        self.assertEqual(json.loads(self.request('/api/history/list', {})[1])['total'], 0)
+        self.assertEqual(web.saved_key(), 'fake-key')
+
+    def test_failed_calls_and_invalid_save_flag_are_not_saved(self):
+        web.save_key('fake-key')
+        with patch.object(web, 'ask') as ask:
+            for value in ['false', 1, None, []]:
+                self.assertEqual(self.request('/api/ask', {'text': '内容', 'question': '是否？', 'save_history': value})[0], 400)
+            ask.assert_not_called()
+        with patch.object(web, 'ask', side_effect=TimeoutError()):
+            self.assertEqual(self.request('/api/ask', {'text': '内容', 'question': '是否？', 'save_history': True})[0], 502)
+        self.assertFalse(history.HISTORY_FILE.exists())
+
+    def test_storage_failure_keeps_successful_answer(self):
+        web.save_key('fake-key')
+        for error in [OSError('secret-path'), sqlite3.OperationalError('secret-path')]:
+            with patch.object(web, 'ask', return_value=0.8), patch.object(history, 'save', side_effect=error):
+                status, body = self.request('/api/ask', {'text': '内容', 'question': '是否？', 'save_history': True})
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body)['yes'], 0.8)
+                self.assertFalse(json.loads(body)['history_saved'])
+                self.assertNotIn('secret-path', body)
+
+    def test_history_endpoints_require_request_token(self):
+        for path in ['list', 'get', 'delete', 'clear']:
+            for headers in [{'X-Jev-Token': ''}, {'Origin': 'https://evil.example'}]:
+                self.assertEqual(self.request('/api/history/' + path, {'id': 'test'}, headers)[0], 403)
+        self.assertEqual(self.request('/api/history/list')[0], 404)
+        for value in [-1, True, '0', 2**63]:
+            self.assertEqual(self.request('/api/history/list', {'offset': value})[0], 400)
+        self.assertFalse(history.HISTORY_FILE.exists())
 
 
 if __name__ == '__main__':
